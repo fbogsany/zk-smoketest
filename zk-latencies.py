@@ -16,7 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import datetime, time, os
+import datetime, time, os, re
 from optparse import OptionParser
 
 import zkclient
@@ -50,6 +50,10 @@ parser.add_option("", "--synchronous",
                   action="store_true", dest="synchronous", default=False,
                   help="by default asynchronous ZK api is used, this forces synchronous calls")
 
+parser.add_option("", "--locks",
+                  action="store_true", dest="locks", default=False,
+                  help="this tests latency of a ghetto synchronous shared lock implementation")
+
 parser.add_option("-v", "--verbose",
                   action="store_true", dest="verbose", default=False,
                   help="verbose output, include more detail")
@@ -62,6 +66,37 @@ parser.add_option("-q", "--quiet",
 zkclient.options = options
 
 zookeeper.set_log_stream(open("cli_log_%d.txt" % (os.getpid()),"w"))
+
+class SharedLocker:
+    def __init__(self, client, path, root_lock_node):
+        self.client = client
+        self.path = path
+        self.root_lock_node = root_lock_node
+        self.root_lock_path = "%s/%s" % (root_lock_node, re.sub("/", "__", path))
+        self.lock_path = None
+    def unlock(self):
+        self.client.delete(self.lock_path)
+        self.client.delete(self.root_lock_path)
+    def lock(self):
+        while True:
+            try:
+                if self.lock_path and self.client.exists(self.lock_path):
+                    pass
+                else:
+                    self.lock_path = self.client.create("%s/%s" % (self.root_lock_path, "sh"), "", zookeeper.EPHEMERAL + zookeeper.SEQUENCE)
+                    self.parent_stat = self.client.exists(self.root_lock_path)
+                return self.lock_path and not self.blocking_locks()
+            except:
+                self.mkdir_p(self.root_lock_path)
+    def mkdir_p(self, path):
+        while path:
+            try:
+                self.client.create(path)
+            except:
+                (path, _, _) = path.rpartition("/")
+    def blocking_locks(self):
+        self.client.get_children(self.root_lock_path)
+        return False
 
 class SmokeError(Exception):
     def __init__(self, value):
@@ -90,6 +125,16 @@ def timer2(func, msg, count=options.znode_count):
 
 def child_path(i):
     return "%s/session_%d" % (options.root_znode, i)
+
+def cycle_lock(s, j, data):
+    lock = SharedLocker(s, "lock", "/shopify/shops/%d" % (j))
+    lock.lock()
+    lock.unlock()
+
+def lock_latency_test(s, data):
+    timer((cycle_lock(s, j, data)
+           for j in xrange(options.znode_count)),
+          "cycled %7d locks " % (options.znode_count))
 
 def synchronous_latency_test(s, data):
     # create znode_count znodes (perm)
@@ -309,6 +354,8 @@ if __name__ == '__main__':
     for i, s in enumerate(sessions):
         if options.synchronous:
             type = "syncronous" 
+        elif options.locks:
+            type = "synchronous lock"
         else:
             type = "asynchronous"
         print("Testing latencies on server %s using %s calls" %
@@ -316,6 +363,8 @@ if __name__ == '__main__':
 
         if options.synchronous:
             synchronous_latency_test(s, data)
+        elif options.locks:
+            lock_latency_test(s, data)
         else:
             asynchronous_latency_test(s, data)
 
